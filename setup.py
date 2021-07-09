@@ -46,10 +46,14 @@ if __name__ in ('__main__', 'builtins'):
 
         description='A server for rabbit tunnel',
         long_description=long_description,
-        url='https://git.elicer.io/elice/backend/elice-backend-default-python',
+        long_description_content_type='text/markdown',
 
-        author='elice.io',
-        author_email='contact@elice.io',
+        license='MIT License',
+
+        url='https://github.com/pjknkda/rabbit-tunnel-server',
+
+        author='Jungkook Park',
+        author_email='pjknkda@gmail.com',
 
         classifiers=[
             'Development Status :: 5 - Production/Stable',
