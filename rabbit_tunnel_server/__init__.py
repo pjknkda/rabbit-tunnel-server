@@ -49,6 +49,8 @@ class Server:
         if debug:
             _setup_debug_logger()
 
+        self.service_domain = service_domain
+
         self.web_app = Starlette(
             on_startup=[self._app_startup],
             on_shutdown=[self._app_shutdown],
@@ -191,6 +193,14 @@ class Server:
         eviction_checker_task = asyncio.create_task(_eviction_checker())
 
         try:
+            await ws.send_bytes(
+                msgpack.packb({
+                    'type': 'welcome',
+                    'conn_uid': None,
+                    'domain': self.service_domain,
+                })
+            )
+
             while True:
                 recv_msg = await ws.receive()
                 if recv_msg['type'] == 'websocket.disconnect':
