@@ -162,7 +162,11 @@ class Multiplexer:
                 return
 
             try:
-                while buf := await reader.read(_READ_BUFFER):
+                while True:
+                    buf = await reader.read(_READ_BUFFER)
+                    if not buf:
+                        break
+
                     await tunnel_entry.ws.send_bytes(
                         msgpack.packb({
                             'type': 'data',
@@ -252,12 +256,11 @@ class MultiplexedConnectionSetup:
 
         host_found: str | None = None
         for header_name, header_value in self._headers:
-            if (
-                header_name == b'host'
-                and (m := re.match(self._host_regex, header_value.decode(), re.IGNORECASE))
-            ):
-                host_found = m.group(1)
-                break
+            if header_name == b'host':
+                m = re.match(self._host_regex, header_value.decode(), re.IGNORECASE)
+                if m is not None:
+                    host_found = m.group(1)
+                    break
 
         if host_found is None:
             raise MultiplexError(HTTPErrorHeader.BAD_REQUEST, MultiplexErrorCode.NO_TARGET_HOST_HEADER)
