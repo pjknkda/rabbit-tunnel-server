@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import datetime
 import enum
 import logging
 import re
-import uuid
+import time
 from email.utils import formatdate
 from time import mktime
-from typing import Any, NamedTuple
+from typing import Any
 
 import async_timeout
 import httptools
@@ -18,6 +19,7 @@ from websockets.exceptions import ConnectionClosed as WsConnectionClosed
 from .tunnel_directory import TunnelDirectory
 
 _READ_BUFFER = 4 * 2**10  # 4KB
+_SETUP_HEADER_TIMEOUT = 10  # 10 seconds
 _SETUP_CONNECTED_TIMEOUT = 10  # 10 seconds
 
 
@@ -38,7 +40,7 @@ class HTTPErrorHeader(enum.Enum):
 class MultiplexErrorCode(enum.Enum):
     PARSE_ERROR = enum.auto()
     INSUFFICIENT_DATA = enum.auto()
-    HEARDER_IS_TOO_LARGE = enum.auto()
+    HEARDER_TIMEOUT = enum.auto()
     NO_TARGET_HOST_HEADER = enum.auto()
     NO_TARGET_TUNNEL = enum.auto()
     UNRESPONSIVE = enum.auto()
@@ -51,13 +53,17 @@ class MultiplexError(Exception):
         self.code = code
 
 
-class MultiplexedConnection(NamedTuple):
+@dataclasses.dataclass
+class MultiplexedConnection:
     conn_uid: str
     connected: asyncio.Event
     connected_ack: asyncio.Event
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     c2s_queue: asyncio.Queue[dict[str, Any]]
+    tunnel_name: str | None
+    tunnel_uid: str | None
+    last_keepalive_ts: float
 
 
 def _generate_http_error(header: HTTPErrorHeader, code: MultiplexErrorCode) -> bytes:
@@ -98,6 +104,22 @@ class Multiplexer:
     def get_connection(self, conn_uid: str) -> MultiplexedConnection | None:
         return self._conn_uid_to_conn.get(conn_uid)
 
+    def summary(self) -> dict[str, Any]:
+        current_ts = time.monotonic()
+
+        return {
+            'active_conns': [
+                {
+                    'uid': conn.conn_uid,
+                    'tunnel_name': conn.tunnel_name,
+                    'tunnel_uid': conn.tunnel_uid,
+                    'from_last_keepalive': current_ts - conn.last_keepalive_ts,
+                }
+                for conn in self._conn_uid_to_conn.values()
+            ],
+            'conn_counter': self._conn_counter,
+        }
+
     async def _on_connection(
         self,
         reader: asyncio.StreamReader,
@@ -115,6 +137,9 @@ class Multiplexer:
             reader=reader,
             writer=writer,
             c2s_queue=asyncio.Queue(),
+            tunnel_name=None,
+            tunnel_uid=None,
+            last_keepalive_ts=time.monotonic(),
         )
 
         self._conn_uid_to_conn[conn_uid] = multiplexed_connection
@@ -124,7 +149,11 @@ class Multiplexer:
 
         try:
             conn_setup = MultiplexedConnectionSetup(self.service_domain, reader)
-            tunnel_name, setup_bytes = await conn_setup.process()
+            try:
+                async with async_timeout.timeout(_SETUP_HEADER_TIMEOUT):
+                    tunnel_name, setup_bytes = await conn_setup.process()
+            except asyncio.TimeoutError:
+                raise MultiplexError(HTTPErrorHeader.BAD_REQUEST, MultiplexErrorCode.HEARDER_TIMEOUT)
 
             tunnel_entry = await self.tunnel_directory.get(tunnel_name)
             if tunnel_entry is None:
@@ -181,11 +210,15 @@ class Multiplexer:
             if not is_something_writed:
                 writer.write(_generate_http_error(err.header, err.code))
 
+            logger.debug('Connection %s is closed by error : %s / %s', conn_uid, err.header.name, err.code.name)
+
         except Exception:
             logger.exception('Exception from multiplexed TCP connection')
 
             if not is_something_writed:
                 writer.write(_generate_http_error(HTTPErrorHeader.INTERNAL_SERVER_ERROR, MultiplexErrorCode.UNEXPECTED))
+
+            logger.debug('Connection %s is closed by exception', conn_uid)
 
         finally:
             if tunnel_entry is not None:

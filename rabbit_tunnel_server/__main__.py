@@ -55,7 +55,7 @@ def main() -> None:
 
     try:
         server = Server(args.service_domain, args.multiplexer_host, args.multiplexer_port, args.debug)
-        uvicorn.run(server.web_app, host=args.webserver_host, port=args.webserver_port)
+        uvicorn.run(server.web_app, host=args.webserver_host, port=args.webserver_port, access_log=False)
     except KeyboardInterrupt:
         pass
 

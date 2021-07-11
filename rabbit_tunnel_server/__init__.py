@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -10,7 +11,7 @@ import async_timeout
 import msgpack
 import websockets.exceptions
 from starlette.applications import Starlette
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.websockets import WebSocketState
 
 from .multiplexer import MultiplexedConnection, Multiplexer
@@ -18,7 +19,6 @@ from .tunnel_directory import InMemoryTunnelDirectory, NameConflictError
 
 if TYPE_CHECKING:
     from starlette.requests import Request
-    from starlette.responses import Response
     from starlette.websockets import WebSocket
 
 __all__ = ['init_environment', 'Server']
@@ -75,15 +75,31 @@ class Server:
         return JSONResponse({'ok': True})
 
     async def _stats_route(self, request: Request) -> Response:
-        return JSONResponse(self._tunnel_directory.summary())
+        return Response(
+            json.dumps(
+                {
+                    'tunnel_directory': self._tunnel_directory.summary(),
+                    'multiplexer': self._multiplexer.summary(),
+                },
+                indent=2,
+            ),
+            media_type='application/json',
+        )
 
-    async def _c2s_puller(self, multiplexed_connection: MultiplexedConnection) -> None:
-        last_keepalive_ts = time.monotonic()
+    async def _c2s_puller(
+        self,
+        tunnel_name: str,
+        tunnel_uid: str,
+        multiplexed_connection: MultiplexedConnection,
+    ) -> None:
+        multiplexed_connection.tunnel_name = tunnel_name
+        multiplexed_connection.tunnel_uid = tunnel_uid
 
         async def _keepalive_checker() -> None:
             while True:
                 await asyncio.sleep(_PORXY_CONNECTION_KEEPALIVE_INTERVAL)
-                if time.monotonic() - last_keepalive_ts <= 3 * _PORXY_CONNECTION_KEEPALIVE_INTERVAL:
+                from_last_keepalive = time.monotonic() - multiplexed_connection.last_keepalive_ts
+                if from_last_keepalive <= 3 * _PORXY_CONNECTION_KEEPALIVE_INTERVAL:
                     continue
 
                 multiplexed_connection.c2s_queue.put_nowait({
@@ -114,7 +130,12 @@ class Server:
                         # frontend is already closed
                         break
 
-                    logger.debug('Connection %s is established', multiplexed_connection.conn_uid)
+                    logger.debug(
+                        'Connection %s is established for [%s] (UID: %s)',
+                        multiplexed_connection.conn_uid,
+                        tunnel_name,
+                        tunnel_uid[:8],
+                    )
 
                 elif msg['type'] == 'data':
                     if not (
@@ -123,6 +144,8 @@ class Server:
                     ):
                         raise RuntimeError('Invalid state: data message before setup-ok message')
 
+                    multiplexed_connection.last_keepalive_ts = time.monotonic()
+
                     try:
                         multiplexed_connection.writer.write(msg['data'])
                         await multiplexed_connection.writer.drain()
@@ -130,12 +153,14 @@ class Server:
                         break
 
                 elif msg['type'] == 'keepalive':
-                    last_keepalive_ts = time.monotonic()
+                    multiplexed_connection.last_keepalive_ts = time.monotonic()
 
                 elif msg['type'] == 'closed':
                     logger.debug(
-                        'Connection %s is closed : %s',
+                        'Connection %s is closed for [%s] (UID: %s) : %s',
                         multiplexed_connection.conn_uid,
+                        tunnel_name,
+                        tunnel_uid[:8],
                         msg['reason'],
                     )
                     break
@@ -180,12 +205,12 @@ class Server:
             await ws.close(code=TunnelClosedCode.NameConflict)
             return
 
-        logger.info('Tunnel %s is connected', tunnel_entry.uid)
+        logger.info('Tunnel [%s] (UID: %s) is connected', name, tunnel_entry.uid[:8])
 
         async def _eviction_checker() -> None:
             await self._tunnel_directory.wait_until_die(name, tunnel_entry.uid)
 
-            logger.debug('Tunnel %s is evicted', tunnel_entry.uid)
+            logger.debug('Tunnel [%s] (UID: %s) is evicted', name, tunnel_entry.uid[:8])
 
             if ws.client_state != WebSocketState.DISCONNECTED:
                 await ws.close(code=TunnelClosedCode.Evicted)
@@ -227,7 +252,7 @@ class Server:
                         continue
 
                     self._c2s_puller_dict[msg['conn_uid']] = asyncio.create_task(
-                        self._c2s_puller(multiplexed_connection)
+                        self._c2s_puller(name, tunnel_entry.uid, multiplexed_connection)
                     )
 
                 await multiplexed_connection.c2s_queue.put(msg)
@@ -255,4 +280,4 @@ class Server:
         if ws.client_state != WebSocketState.DISCONNECTED:
             await ws.close()
 
-        logger.info('Tunnel %s is closed', tunnel_entry.uid)
+        logger.info('Tunnel [%s] (UID: %s) is closed', name, tunnel_entry.uid[:8])
