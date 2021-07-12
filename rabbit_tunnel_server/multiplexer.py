@@ -271,7 +271,7 @@ class MultiplexedConnectionSetup:
 
         while not self._is_header_completed:
             buf = await self.reader.read(_READ_BUFFER)
-            if buf is None:
+            if not buf:
                 # early termination
                 raise MultiplexError(HTTPErrorHeader.BAD_REQUEST, MultiplexErrorCode.INSUFFICIENT_DATA)
 
