@@ -2,30 +2,46 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import hashlib
+import hmac
 import json
 import logging
+import os
 import time
 from typing import TYPE_CHECKING
 
-import async_timeout
 import msgpack
 import websockets.exceptions
 from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response
 from starlette.websockets import WebSocketState
 
-from .multiplexer import MultiplexedConnection, Multiplexer
+from .multiplexer import Multiplexer
 from .tunnel_directory import InMemoryTunnelDirectory, NameConflictError
 
 if TYPE_CHECKING:
     from starlette.requests import Request
     from starlette.websockets import WebSocket
 
-__all__ = ['init_environment', 'Server']
+try:
+    from setuptools_scm import get_version
+
+    __version__ = get_version(root="..", relative_to=__file__)
+except LookupError:
+    try:
+        from ._version import version
+
+        __version__ = version
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            "Cannot determine version: "
+            "check whether git repository is initialized "
+            "or _version.py file exists."
+        )
+
+__all__ = ["init_environment", "Server"]
 
 logger = logging.getLogger(__name__)
-
-_PORXY_CONNECTION_KEEPALIVE_INTERVAL = 30  # 30 seconds
 
 
 class TunnelClosedCode(enum.IntEnum):
@@ -44,26 +60,39 @@ def _setup_debug_logger() -> None:
     logger.handlers.append(handler)
 
 
-class Server:
-    def __init__(self, service_domain: str, multiplexer_host: str, multiplexer_port: int, debug: bool = False) -> None:
+class ControlServer:
+    def __init__(
+        self,
+        service_domain: str,
+        multiplexer_host: str,
+        multiplexer_port: int,
+        secret_key: str,
+        debug: bool = False,
+    ) -> None:
         if debug:
             _setup_debug_logger()
 
         self.service_domain = service_domain
+        self.secret_key = secret_key or os.getenv("SECRET_KEY", "")
 
         self.web_app = Starlette(
             on_startup=[self._app_startup],
             on_shutdown=[self._app_shutdown],
         )
 
-        self.web_app.router.add_route('/', self._index_route, ['GET'])
-        self.web_app.router.add_route('/stats', self._stats_route, ['GET'])
-        self.web_app.router.add_websocket_route('/tunnel/{name:str}', self._tunnel_ws_route)
+        self.web_app.router.add_route("/", self._index_route, ["GET"])
+        self.web_app.router.add_route("/stats", self._stats_route, ["GET"])
+        self.web_app.router.add_websocket_route(
+            "/tunnel/{name:str}", self._tunnel_ws_route
+        )
 
         self._tunnel_directory = InMemoryTunnelDirectory()
-        self._multiplexer = Multiplexer(service_domain, multiplexer_host, multiplexer_port, self._tunnel_directory)
-
-        self._c2s_puller_dict: dict[str, asyncio.Task] = {}
+        self._multiplexer = Multiplexer(
+            service_domain,
+            multiplexer_host,
+            multiplexer_port,
+            self._tunnel_directory,
+        )
 
     async def _app_startup(self) -> None:
         await self._multiplexer.start()
@@ -71,146 +100,79 @@ class Server:
     async def _app_shutdown(self) -> None:
         await self._multiplexer.stop()
 
-    async def _index_route(self, request: Request) -> Response:
-        return JSONResponse({'ok': True})
+    async def _index_route(self, _: Request) -> Response:
+        return JSONResponse({"ok": True})
 
-    async def _stats_route(self, request: Request) -> Response:
+    async def _stats_route(self, _: Request) -> Response:
+        # TODO : only details only if debug mode
         return Response(
             json.dumps(
                 {
-                    'tunnel_directory': self._tunnel_directory.summary(),
-                    'multiplexer': self._multiplexer.summary(),
+                    "tunnel_directory": self._tunnel_directory.summary(),
+                    "multiplexer": self._multiplexer.summary(),
                 },
                 indent=2,
             ),
-            media_type='application/json',
+            media_type="application/json",
         )
 
-    async def _c2s_puller(
-        self,
-        tunnel_name: str,
-        tunnel_uid: str,
-        multiplexed_connection: MultiplexedConnection,
-    ) -> None:
-        multiplexed_connection.tunnel_name = tunnel_name
-        multiplexed_connection.tunnel_uid = tunnel_uid
-
-        async def _keepalive_checker() -> None:
-            while True:
-                await asyncio.sleep(_PORXY_CONNECTION_KEEPALIVE_INTERVAL)
-                from_last_keepalive = time.monotonic() - multiplexed_connection.last_keepalive_ts
-                if from_last_keepalive <= 3 * _PORXY_CONNECTION_KEEPALIVE_INTERVAL:
-                    continue
-
-                multiplexed_connection.c2s_queue.put_nowait({
-                    'type': 'closed',
-                    'reason': 'client-keepalive-timeout',
-                })
-                return
-
-        keepalive_checker_task = asyncio.create_task(_keepalive_checker())
-
-        try:
-            while True:
-                msg = await multiplexed_connection.c2s_queue.get()
-
-                if msg['type'] == 'setup-ok':
-                    if not (
-                        not multiplexed_connection.connected.is_set()
-                        and not multiplexed_connection.connected_ack.is_set()
-                    ):
-                        raise RuntimeError('Invalid state: duplicated setup-ok messages')
-
-                    multiplexed_connection.connected.set()
-
-                    try:
-                        async with async_timeout.timeout(10):
-                            await multiplexed_connection.connected_ack.wait()
-                    except asyncio.TimeoutError:
-                        # frontend is already closed
-                        break
-
-                    logger.debug(
-                        'Connection %s is established for [%s] (UID: %s)',
-                        multiplexed_connection.conn_uid,
-                        tunnel_name,
-                        tunnel_uid[:8],
-                    )
-
-                elif msg['type'] == 'data':
-                    if not (
-                        multiplexed_connection.connected.is_set()
-                        and multiplexed_connection.connected_ack.is_set()
-                    ):
-                        raise RuntimeError('Invalid state: data message before setup-ok message')
-
-                    multiplexed_connection.last_keepalive_ts = time.monotonic()
-
-                    try:
-                        multiplexed_connection.writer.write(msg['data'])
-                        await multiplexed_connection.writer.drain()
-                    except ConnectionResetError:
-                        break
-
-                elif msg['type'] == 'keepalive':
-                    multiplexed_connection.last_keepalive_ts = time.monotonic()
-
-                elif msg['type'] == 'closed':
-                    logger.debug(
-                        'Connection %s is closed for [%s] (UID: %s) : %s',
-                        multiplexed_connection.conn_uid,
-                        tunnel_name,
-                        tunnel_uid[:8],
-                        msg['reason'],
-                    )
-                    break
-
-                else:
-                    raise NotImplementedError()
-
-                multiplexed_connection.c2s_queue.task_done()
-
-        except asyncio.CancelledError:
-            pass
-
-        except Exception:
-            logger.exception('Exception from client-to-server puller : %s', multiplexed_connection.conn_uid)
-
-        finally:
-            try:
-                keepalive_checker_task.cancel()
-                await keepalive_checker_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception('Exception from tunnel proxy connection keepalive checker')
-
-            multiplexed_connection.reader.feed_eof()
-            del self._c2s_puller_dict[multiplexed_connection.conn_uid]
-
     async def _tunnel_ws_route(self, ws: WebSocket) -> None:
-        await ws.accept()
+        req_name_raw: str = ws.path_params["name"]
 
-        name: str = ws.path_params['name']
-
-        if name.startswith('!'):
+        if req_name_raw.startswith("!"):
             force = True
-            name = name[1:]
+            req_name = req_name_raw[1:]
         else:
             force = False
+            req_name = req_name_raw
+
+        if self.secret_key:
+            token: str = ws.query_params.get("token", "")
+            try:
+                token_digest, token_exp_str = token.split(":", maxsplit=1)
+
+                token_exp = int(token_exp_str)
+                if token_exp < time.time():
+                    raise RuntimeError("expired token")
+
+                if not hmac.compare_digest(
+                    token_digest,
+                    hmac.new(
+                        key=hashlib.sha256(self.secret_key.encode()).digest(),
+                        msg=f"{token_exp_str}:{req_name_raw}".encode(),
+                        digestmod=hashlib.sha256,
+                    ).hexdigest(),
+                ):
+                    raise RuntimeError("wrong token digest")
+
+            except Exception:
+                await ws.close()
+                return
+
+        await ws.accept()
 
         try:
-            tunnel_entry = await self._tunnel_directory.acquire(name, ws, force)
+            tunnel_entry = await self._tunnel_directory.acquire(
+                req_name, ws, force
+            )
         except NameConflictError:
             await ws.close(code=TunnelClosedCode.NameConflict)
             return
 
-        logger.info('Tunnel [%s] (UID: %s) is connected', name, tunnel_entry.uid[:8])
+        logger.info(
+            "Tunnel [%s] (UID: %s) is connected",
+            tunnel_entry.name,
+            tunnel_entry.uid[:8],
+        )
 
         async def _eviction_checker() -> None:
-            await self._tunnel_directory.wait_until_die(name, tunnel_entry.uid)
+            await self._tunnel_directory.wait_until_die(tunnel_entry)
 
-            logger.debug('Tunnel [%s] (UID: %s) is evicted', name, tunnel_entry.uid[:8])
+            logger.debug(
+                "Tunnel [%s] (UID: %s) is evicted",
+                tunnel_entry.name,
+                tunnel_entry.uid[:8],
+            )
 
             if ws.client_state != WebSocketState.DISCONNECTED:
                 await ws.close(code=TunnelClosedCode.Evicted)
@@ -219,65 +181,97 @@ class Server:
 
         try:
             await ws.send_bytes(
-                msgpack.packb({
-                    'type': 'welcome',
-                    'conn_uid': None,
-                    'domain': self.service_domain,
-                })
+                msgpack.packb(
+                    {
+                        "type": "welcome",
+                        "conn_uid": None,
+                        "name": tunnel_entry.name,
+                        "domain": self.service_domain,
+                    }
+                )
             )
 
             while True:
                 recv_msg = await ws.receive()
-                if recv_msg['type'] == 'websocket.disconnect':
+                if recv_msg["type"] == "websocket.disconnect":
                     break
 
-                msg = msgpack.unpackb(recv_msg['bytes'])
+                msg = msgpack.unpackb(recv_msg["bytes"])
                 if not (
                     isinstance(msg, dict)
-                    and 'type' in msg
-                    and 'conn_uid' in msg
+                    and "type" in msg
+                    and "conn_uid" in msg
                 ):
                     # invalid msg format
                     continue
 
-                multiplexed_connection = self._multiplexer.get_connection(msg['conn_uid'])
+                m_conn = self._multiplexer.get_connection(msg["conn_uid"])
 
-                if multiplexed_connection is None:
+                if m_conn is None:
                     # expired connection
                     continue
 
-                if msg['type'] == 'setup-ok':
-                    if msg['conn_uid'] in self._c2s_puller_dict:
-                        logger.warning('Invalid state: connection is already registered')
+                if msg["type"] == "setup-ok":
+                    if m_conn.setup_result.done():
+                        logger.warning(
+                            "Invalid state: connection setup is already called"
+                        )
                         continue
 
-                    self._c2s_puller_dict[msg['conn_uid']] = asyncio.create_task(
-                        self._c2s_puller(name, tunnel_entry.uid, multiplexed_connection)
-                    )
+                    m_conn.set_setup_result(True)
 
-                await multiplexed_connection.c2s_queue.put(msg)
+                elif msg["type"] == "data":
+                    if m_conn.is_closed:
+                        continue
+
+                    m_conn.last_keepalive_ts = time.monotonic()
+
+                    try:
+                        m_conn.writer.write(msg["data"])
+                        await m_conn.writer.drain()
+                    except (RuntimeError, ConnectionError):
+                        continue
+
+                elif msg["type"] == "keepalive":
+                    if m_conn.is_closed:
+                        continue
+
+                    m_conn.last_keepalive_ts = time.monotonic()
+
+                elif msg["type"] == "closed":
+                    if m_conn.is_closed:
+                        continue
+
+                    m_conn.set_closed_reason(msg["reason"])
+
+                else:
+                    logger.warning("Unexpected msg : %s", msg)
 
         except websockets.exceptions.ConnectionClosedOK:
             pass
 
         except Exception:
-            logger.exception('Exception from tunnel WS connection')
+            logger.exception("Exception from tunnel WS connection")
 
         finally:
-            for puller_task in self._c2s_puller_dict.values():
-                puller_task.cancel()
-
             eviction_checker_task.cancel()
             try:
                 await eviction_checker_task
             except asyncio.CancelledError:
                 pass
             except Exception:
-                logger.warning('Exception while canceling eviction_checker_task', exc_info=True)
+                logger.warning(
+                    "Exception while canceling eviction_checker_task",
+                    exc_info=True,
+                )
 
-            await self._tunnel_directory.release(name, tunnel_entry.uid)
+            await self._tunnel_directory.release(tunnel_entry)
 
-        if ws.client_state != WebSocketState.DISCONNECTED:
-            await ws.close()
+            if ws.client_state != WebSocketState.DISCONNECTED:
+                await ws.close()
 
-        logger.info('Tunnel [%s] (UID: %s) is closed', name, tunnel_entry.uid[:8])
+            logger.info(
+                "Tunnel [%s] (UID: %s) is closed",
+                tunnel_entry.name,
+                tunnel_entry.uid[:8],
+            )

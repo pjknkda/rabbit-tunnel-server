@@ -3,6 +3,7 @@
 /python-env/
 
 *.lprof
+rabbit_tunnel_server/_version.py
 
 # We will not manage vscode settings in the repo
 /.vscode/
