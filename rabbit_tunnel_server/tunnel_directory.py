@@ -11,6 +11,7 @@ if TYPE_CHECKING:
 
 
 class TunnelEntry(NamedTuple):
+    name: str
     uid: str
     ws: WebSocket
 
@@ -25,15 +26,17 @@ class TunnelDirectory(abc.ABC):
         raise NotImplementedError()
 
     @abc.abstractmethod
-    async def acquire(self, name: str, ws: WebSocket, force: bool = False) -> TunnelEntry:
+    async def acquire(
+        self, name: str, ws: WebSocket, force: bool = False
+    ) -> TunnelEntry:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    async def release(self, name: str, tunnel_uid: str) -> None:
+    async def release(self, entry: TunnelEntry) -> None:
         raise NotImplementedError()
 
     @abc.abstractmethod
-    async def wait_until_die(self, name: str, tunnel_uid: str) -> None:
+    async def wait_until_die(self, entry: TunnelEntry) -> None:
         raise NotImplementedError()
 
     @abc.abstractmethod
@@ -47,49 +50,45 @@ class InMemoryTunnelDirectory(TunnelDirectory):
         self._lock = threading.RLock()
 
     async def get(self, name: str) -> TunnelEntry | None:
-        return self._name_to_entry.get(name)
+        return self._name_to_entry.get(name.lower())
 
-    async def acquire(self, name: str, ws: WebSocket, force: bool = False) -> TunnelEntry:
+    async def acquire(
+        self, name: str, ws: WebSocket, force: bool = False
+    ) -> TunnelEntry:
+        name_lower = name.lower()
+
         with self._lock:
-            if (
-                name in self._name_to_entry
-                and not force
-            ):
+            if name_lower in self._name_to_entry and not force:
                 raise NameConflictError()
 
-            self._name_to_entry[name] = TunnelEntry(
+            self._name_to_entry[name_lower] = TunnelEntry(
+                name=name_lower,
                 uid=uuid.uuid4().hex,
                 ws=ws,
             )
 
-            return self._name_to_entry[name]
+            return self._name_to_entry[name_lower]
 
-    async def release(self, name: str, tunnel_uid: str) -> None:
+    async def release(self, entry: TunnelEntry) -> None:
         with self._lock:
-            entry = self._name_to_entry.get(name)
+            active_entry = self._name_to_entry.get(entry.name)
 
-            if (
-                entry is None
-                or entry.uid != tunnel_uid
-            ):
+            if active_entry is None or active_entry.uid != entry.uid:
                 return
 
-            del self._name_to_entry[name]
+            del self._name_to_entry[entry.name]
 
-    async def wait_until_die(self, name: str, tunnel_uid: str) -> None:
+    async def wait_until_die(self, entry: TunnelEntry) -> None:
         while True:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.5)
 
             with self._lock:
-                entry = self._name_to_entry.get(name)
+                active_entry = self._name_to_entry.get(entry.name)
 
-                if (
-                    entry is None
-                    or entry.uid != tunnel_uid
-                ):
+                if active_entry is None or active_entry.uid != entry.uid:
                     break
 
     def summary(self) -> dict[str, Any]:
         return {
-            'num_tunnels': len(self._name_to_entry),
+            "num_tunnels": len(self._name_to_entry),
         }

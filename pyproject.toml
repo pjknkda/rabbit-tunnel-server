@@ -1,0 +1,126 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm[toml]"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+authors = [{ email = "pjknkda@gmail.com" }, { name = "Jungkook Park" }]
+description = "A server for rabbit tunnel"
+name = "rabbit-tunnel-server"
+readme = "README.md"
+
+classifiers = [
+    'Development Status :: 5 - Production/Stable',
+    'Programming Language :: Python :: 3.7',
+    'Programming Language :: Python :: 3.8',
+    'Programming Language :: Python :: 3.9',
+    'Programming Language :: Python :: 3.10',
+    'Programming Language :: Python :: Implementation :: CPython',
+    'Operating System :: POSIX',
+    'Operating System :: MacOS :: MacOS X',
+]
+
+requires-python = ">=3.7,<3.11"
+dependencies = [
+    "async-timeout==4.0.2",
+    "httptools==0.4.0",
+    "msgpack==1.0.4",
+    "setuptools-scm==6.3.2",
+    "starlette==0.20.4",
+    "uvicorn==0.18.2",
+    "uvloop==0.16.0; platform_system != 'Windows'",
+    "websockets==10.3",
+]
+
+dynamic = ["version"]
+
+[project.optional-dependencies]
+dev = [
+    "autopep8==1.6.0",
+    "bandit==1.7.4",
+    "flake8-bugbear==22.7.1",
+    "flake8-datetimez==20.10.0",
+    "flake8-isort==4.1.2.post0",
+    "flake8-logging-format==0.6.0",
+    "flake8-quotes==3.3.1",
+    "flake8==4.0.1",
+    "mypy==0.971",
+    "pip-tools",                    # do not pin
+    "pytest-cov==3.0.0",
+    "pytest-env==0.6.2",
+    "pytest==7.1.2",
+    "safety==2.1.1",
+]
+
+[project.scripts]
+rt-server = "rabbit_tunnel_server.__main__:main"
+
+
+[tool.black]
+line-length = 80
+
+
+[tool.coverage.run]
+source = "rabbit_tunnel_server/*"
+
+
+[tool.coverage.report]
+precision = 2
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:"]
+
+
+[tool.isort]
+profile = "black"
+line_length = 80
+virtual_env = "python-env"
+
+
+[tool.mypy]
+python_version = "3.10"
+
+disallow_untyped_defs = true
+check_untyped_defs = true
+
+warn_return_any = true
+
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = "httptools"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "msgpack"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pytest"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "_pytest.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "setuptools_scm"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "uvicorn"
+ignore_missing_imports = true
+
+
+[tool.pytest.ini_options]
+addopts = "--cov-report html --cov=rabbit_tunnel_server"
+asyncio_mode = "strict"
+testpaths = ["tests"]
+
+
+[tool.setuptools]
+packages = ["rabbit_tunnel_server"]
+
+
+[tool.setuptools_scm]
+write_to = "rabbit_tunnel_server/_version.py"
