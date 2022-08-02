@@ -24,8 +24,8 @@ _SETUP_HEADER_TIMEOUT = 10  # 10 seconds
 _SETUP_HEADER_MAX_SIZE = 16 * 2**10  # 16 KB
 _SETUP_CONNECTED_TIMEOUT = 10  # 10 seconds
 
-_KEEPALIVE_INTERVAL = 3  # 30 seconds
-_KEEPALIVE_COUNT = 2
+_KEEPALIVE_INTERVAL = 30  # 30 seconds
+_KEEPALIVE_COUNT = 3
 
 logger = logging.getLogger(__name__)
 
